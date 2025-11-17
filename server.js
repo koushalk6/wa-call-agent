@@ -227,12 +227,37 @@ async function handleRemoteIce(callId, candidateObj) {
     console.error('Error addIceCandidate', err);
   }
 }
+//===================================================================
+// function startPushingSilentAudio(callId, audioSource) {
+//   // 48kHz, 16-bit, mono. 20ms frames => 960 samples
+//   const sampleRate = 48000;
+//   const frameMs = 20;
+//   const samples = Math.floor(sampleRate * (frameMs / 1000));
+//   const silentFrame = new Int16Array(samples);
+
+//   const interval = setInterval(() => {
+//     try {
+//       audioSource.onData({
+//         samples: silentFrame,
+//         sampleRate,
+//         bitsPerSample: 16,
+//         channelCount: 1
+//       });
+//     } catch (err) {
+//       console.error('audioSource.onData error for', callId, err);
+//     }
+//   }, frameMs);
+
+//   return interval;
+// }
 
 function startPushingSilentAudio(callId, audioSource) {
-  // 48kHz, 16-bit, mono. 20ms frames => 960 samples
+  // Use 10ms frames which matches the expectation of the RTCAudioSource binding.
+  // At 48000 Hz: 48000 * 0.010 = 480 samples per frame.
   const sampleRate = 48000;
-  const frameMs = 20;
-  const samples = Math.floor(sampleRate * (frameMs / 1000));
+  const frameMs = 10;               // <-- changed from 20 to 10
+  const samples = Math.floor(sampleRate * (frameMs / 1000)); // 480
+  // Int16Array length = samples; byteLength = samples * 2 = 960 bytes (what binding expects)
   const silentFrame = new Int16Array(samples);
 
   const interval = setInterval(() => {
@@ -250,6 +275,10 @@ function startPushingSilentAudio(callId, audioSource) {
 
   return interval;
 }
+
+
+//========================================
+
 
 function cleanupCall(callId) {
   const s = calls.get(callId);
