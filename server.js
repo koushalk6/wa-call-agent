@@ -9,7 +9,7 @@
  * ENV variables:
  *  VERIFY_TOKEN          - webhook verification token (string)
  *  META_ACCESS_TOKEN     - Graph API access token (string)
- *  META_API_VERSION      - e.g. v17.0 (default v17.0)
+ *  META_API_VERSION      - e.g. v17.0 (default v23.0)
  *  META_BASE_URL         - default https://graph.facebook.com
  *  ANSWER_MODE           - "CALL_SCOPED" or "PHONE_SCOPED" (defaults to CALL_SCOPED)
  *
