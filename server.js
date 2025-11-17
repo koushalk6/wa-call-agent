@@ -167,20 +167,44 @@ function cleanupCall(callId) {
 }
 
 // --- Silent Audio Loop ---
+// function startSilentAudioLoop(callId, audioSource) {
+//   const sampleRate = 48000;
+//   const frameMs = 20;
+//   const samples = Math.floor(sampleRate * frameMs / 1000);
+//   const silentFrame = new Int16Array(samples);
+
+//   const interval = setInterval(() => {
+//     try {
+//       audioSource.onData({ samples: silentFrame, sampleRate, bitsPerSample: 16, channelCount: 1 });
+//     } catch (err) { console.error(`Audio frame error for ${callId}`, err); }
+//   }, frameMs);
+
+//   return interval;
+// }
+
+
 function startSilentAudioLoop(callId, audioSource) {
   const sampleRate = 48000;
   const frameMs = 20;
-  const samples = Math.floor(sampleRate * frameMs / 1000);
-  const silentFrame = new Int16Array(samples);
+  const samples = Math.floor(sampleRate * frameMs / 1000); // 960 samples
+  const silentFrame = new Int16Array(samples); // 960 elements
 
   const interval = setInterval(() => {
     try {
-      audioSource.onData({ samples: silentFrame, sampleRate, bitsPerSample: 16, channelCount: 1 });
-    } catch (err) { console.error(`Audio frame error for ${callId}`, err); }
+      audioSource.onData({
+        samples: silentFrame,
+        sampleRate: sampleRate,
+        bitsPerSample: 16,
+        channelCount: 1
+      });
+    } catch (err) {
+      console.error(`Audio frame error for ${callId}`, err);
+    }
   }, frameMs);
 
   return interval;
 }
+//==============================================
 
 // --- Meta Graph API calls ---
 async function sendAnswerToMeta(callId, phoneNumberId, answerSdp) {
