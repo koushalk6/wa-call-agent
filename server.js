@@ -1,17 +1,16 @@
-
 /**
- * Production-ready WhatsApp Cloud API Calling (User-Initiated)
+ * WhatsApp Cloud API Calling (User-Initiated) + TTS Playback
  * Node.js + WebRTC
- * Supports pre-accept + accept + ICE candidates + silent audio loop + pre-recorded TTS
- * Designed for deployment on Cloud Run / containerized environment
+ * Supports pre-accept, accept, ICE candidates, silent audio + TTS
+ * Designed for Cloud Run / container deployment
  */
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const { RTCPeerConnection, nonstandard } = require('wrtc');
 const fs = require('fs');
 const { exec } = require('child_process');
-const { RTCPeerConnection, nonstandard } = require('wrtc');
 
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
@@ -79,6 +78,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
     }
+
     res.status(200).send('EVENT_RECEIVED');
   } catch (err) {
     console.error('Webhook handler error:', err);
@@ -99,18 +99,10 @@ async function handleCallOffer(callId, sdpOffer, phoneNumberId) {
 
   const pc = new RTCPeerConnection({ iceServers });
 
-  // Add silent audio track
+  // --- Add silent audio track ---
   const audioSource = new nonstandard.RTCAudioSource();
   const track = audioSource.createTrack();
   pc.addTrack(track);
-
-  // Fetch and convert TTS to PCM
-  await fetchAndConvertTTS('Welcome to Avasar, the citizen-driven platform. Earn money by completing brand tasks.');
-
-  // Mix TTS PCM into silent audio
-  const ttsBuffer = fs.readFileSync('greeting.pcm');
-  const ttsFrameSize = 960; // 20ms frames at 48kHz
-  let ttsOffset = 0;
 
   const localIce = [];
   pc.onicecandidate = (e) => {
@@ -128,101 +120,158 @@ async function handleCallOffer(callId, sdpOffer, phoneNumberId) {
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
 
-  await new Promise(resolve => {
+  // Wait for ICE gathering
+  await new Promise((resolve) => {
     if (pc.iceGatheringState === 'complete') resolve();
     else pc.onicegatheringstatechange = () => {
       if (pc.iceGatheringState === 'complete') resolve();
     };
   });
 
+  // --- Pre-accept & Accept Call ---
   await preAcceptCall(callId, phoneNumberId, pc.localDescription.sdp);
   await acceptCall(callId, phoneNumberId, pc.localDescription.sdp);
 
-  const interval = setInterval(() => {
-    try {
-      const frame = new Int16Array(960);
-      // Mix TTS
-      for (let i = 0; i < 960 && ttsOffset < ttsBuffer.length / 2; i++, ttsOffset++) {
-        const sample = ttsBuffer.readInt16LE(ttsOffset * 2);
-        frame[i] = sample;
-      }
-      audioSource.onData({ samples: frame, sampleRate: 48000, bitsPerSample: 16, channelCount: 1 });
-    } catch (err) {
-      console.error(`Audio frame error for ${callId}`, err);
-    }
-  }, 20);
-
+  // --- Start silent audio + TTS playback ---
+  const interval = startSilentAudioLoop(callId, audioSource);
   calls.set(callId, { pc, audioSource, track, interval });
+
+  // --- Fetch & play Google TTS ---
+  playTTS(callId, audioSource).catch(console.error);
+
   console.log(`✅ Call ${callId} setup complete`);
 }
 
-// --- Fetch Google TTS + Convert to PCM ---
-async function fetchAndConvertTTS(text) {
-  const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=en&client=tw-ob`;
-  const response = await axios.get(ttsUrl, { responseType: 'arraybuffer' });
+// --- Fetch & play TTS from Google Translate ---
+async function playTTS(callId, audioSource) {
+  const ttsUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&q=YourText%20is%20A%20citizen-driven%20platform%20for%20creators%20and%20individuals%20Earn%20money%20by%20completing%20high-paying%20brand%20tasks%20(installs,%20signups,%20reviews,%20etc.)&tl=en&client=tw-ob';
+
+  const response = await axios.get(ttsUrl, { responseType: 'arraybuffer', headers: { 'User-Agent': 'Mozilla/5.0' } });
   fs.writeFileSync('greeting.mp3', response.data);
 
   await new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i greeting.mp3 -ar 48000 -ac 1 -c:a pcm_s16le greeting.pcm`;
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) reject(err);
-      else resolve();
-    });
+    exec(cmd, (err) => err ? reject(err) : resolve());
   });
+
+  const pcmData = fs.readFileSync('greeting.pcm');
+  const sampleRate = 48000;
+  const frameMs = 20;
+  const samplesPerFrame = Math.floor(sampleRate * frameMs / 1000); // 960 samples
+
+  for (let offset = 0; offset < pcmData.length; offset += samplesPerFrame * 2) { // 16-bit PCM
+    const frame = new Int16Array(samplesPerFrame);
+    for (let i = 0; i < samplesPerFrame; i++) {
+      if (offset + i * 2 + 1 < pcmData.length) {
+        frame[i] = pcmData.readInt16LE(offset + i * 2);
+      }
+    }
+    audioSource.onData({ samples: frame, sampleRate, bitsPerSample: 16, channelCount: 1 });
+    await new Promise(r => setTimeout(r, frameMs));
+  }
+
+  console.log(`✅ TTS playback completed for call ${callId}`);
 }
 
-// --- Handle remote ICE candidate ---
+// --- Handle remote ICE ---
 async function handleRemoteIce(callId, candidateObj) {
   const callState = calls.get(callId);
   if (!callState) return console.warn(`ICE received for unknown call ${callId}`);
+
   let cand = candidateObj;
   if (typeof candidateObj === 'string') cand = { candidate: candidateObj };
+
   try { await callState.pc.addIceCandidate(cand); }
   catch (err) { console.error(`Error adding ICE for ${callId}:`, err); }
 }
 
-// --- Cleanup ---
+// --- Cleanup call ---
 function cleanupCall(callId) {
   const st = calls.get(callId);
   if (!st) return;
+
   try {
     if (st.track) st.track.stop();
     if (st.pc) st.pc.close();
     if (st.interval) clearInterval(st.interval);
   } catch (err) { console.warn('Cleanup error:', err); }
+
   calls.delete(callId);
   console.log(`Call cleaned up: ${callId}`);
 }
 
-// --- WhatsApp Cloud API: Pre-Accept & Accept ---
+// --- Silent Audio Loop ---
+function startSilentAudioLoop(callId, audioSource) {
+  const sampleRate = 48000;
+  const frameMs = 20;
+  const samples = Math.floor(sampleRate * frameMs / 1000);
+  const silentFrame = new Int16Array(samples);
+
+  const interval = setInterval(() => {
+    try {
+      audioSource.onData({ samples: silentFrame, sampleRate, bitsPerSample: 16, channelCount: 1 });
+    } catch (err) {
+      console.error(`Audio frame error for ${callId}`, err);
+    }
+  }, frameMs);
+
+  return interval;
+}
+
+// --- WhatsApp Cloud API calls ---
 async function preAcceptCall(callId, phoneNumberId, answerSdp) {
   const url = `${META_BASE_URL}/${META_API_VERSION}/${phoneNumberId}/calls`;
-  const body = { messaging_product: "whatsapp", call_id: callId, action: "pre_accept", session: { sdp_type: "answer", sdp: answerSdp } };
-  await axios.post(url, body, { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+  const body = {
+    messaging_product: "whatsapp",
+    call_id: callId,
+    action: "pre_accept",
+    session: { sdp_type: "answer", sdp: answerSdp }
+  };
+
+  await axios.post(url, body, {
+    headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }
+  });
   console.log(`✅ Call pre-accepted: ${callId}`);
 }
 
 async function acceptCall(callId, phoneNumberId, answerSdp) {
   const url = `${META_BASE_URL}/${META_API_VERSION}/${phoneNumberId}/calls`;
-  const body = { messaging_product: "whatsapp", call_id: callId, action: "accept", session: { sdp_type: "answer", sdp: answerSdp } };
-  await axios.post(url, body, { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+  const body = {
+    messaging_product: "whatsapp",
+    call_id: callId,
+    action: "accept",
+    session: { sdp_type: "answer", sdp: answerSdp }
+  };
+
+  await axios.post(url, body, {
+    headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }
+  });
   console.log(`✅ Call accepted: ${callId}`);
 }
 
-// --- Send local ICE to Meta ---
 async function sendLocalIceToMeta(callId, phoneNumberId, candidateObj) {
   const url = `${META_BASE_URL}/${META_API_VERSION}/${phoneNumberId}/calls`;
-  const body = { messaging_product: "whatsapp", call_id: callId, type: "ice_candidate", ice: { candidate: candidateObj.candidate, sdpMid: candidateObj.sdpMid, sdpMLineIndex: candidateObj.sdpMLineIndex } };
-  await axios.post(url, body, { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } });
+  const body = {
+    messaging_product: "whatsapp",
+    call_id: callId,
+    type: "ice_candidate",
+    ice: {
+      candidate: candidateObj.candidate,
+      sdpMid: candidateObj.sdpMid,
+      sdpMLineIndex: candidateObj.sdpMLineIndex
+    }
+  };
+
+  await axios.post(url, body, {
+    headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }
+  });
 }
 
 // --- Health Check ---
-app.get('/', (_, res) => res.send('WhatsApp Cloud API Call Handler OK'));
+app.get('/', (_, res) => res.send('WhatsApp Cloud API Call Handler + TTS OK'));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-
 
 
 
