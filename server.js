@@ -254,7 +254,11 @@ function cleanupCall(callId) {
 
 // ================== EXPRESS ==================
 app.get("/", (_, res) => res.send("WhatsApp Real-Time AI Call Handler OK"));
-app.listen(8080, () => console.log("🚀 Running on 8080"));
+
+// app.listen(8080, () => console.log("🚀 Running on 8080"));  //through error by hard code port
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`🚀 Running on port ${PORT}`));
+
 
 
 
