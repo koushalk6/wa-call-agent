@@ -1,8 +1,7 @@
-
 /**
- * WhatsApp Real-Time AI Voice Server
- * Works with: Gemini or ChatGPT
- * PCM: 48kHz, 16-bit, mono, 960 samples/frame
+ * WhatsApp Real-Time AI Voice Server (Crash-Proof Edition)
+ * Supports Gemini + ChatGPT
+ * PCM: 48kHz, 16-bit, mono, 960-sample frames (20ms)
  */
 
 const express = require("express");
@@ -17,285 +16,337 @@ const { RTCPeerConnection, nonstandard } = require("wrtc");
 const app = express();
 app.use(bodyParser.json({ limit: "50mb" }));
 
-// ================= ENV ====================
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "verifytoken";
+// ======================= ENV =======================
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "changeme";
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_API_VERSION = "v21.0";
 const META_BASE_URL = "https://graph.facebook.com";
 
-const AI_MODEL = process.env.AI_MODEL || "gemini"; // gemini / chatgpt
+const AI_MODEL = process.env.AI_MODEL || "gemini"; // or: chatgpt
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
 if (!META_ACCESS_TOKEN) throw new Error("META_ACCESS_TOKEN required");
-if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required");
-if (AI_MODEL === "gemini" && !GOOGLE_API_KEY) throw new Error("GOOGLE_API_KEY required");
+if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required for Whisper/TTS");
+if (AI_MODEL === "gemini" && !GOOGLE_API_KEY)
+  throw new Error("GOOGLE_API_KEY required for Gemini");
 
-// ================= CACHE ====================
+// ======================= CRASH-PROOF AXIOS =======================
+async function safePOST(url, body, headers = {}) {
+  try {
+    return await axios.post(url, body, { headers });
+  } catch (err) {
+    console.error("❌ AXIOS ERROR:", {
+      url,
+      message: err.message,
+      status: err.response?.status,
+      data: err.response?.data,
+    });
+    return null;
+  }
+}
+
+// ======================= CALL CACHE =======================
 const calls = new Map();
 
-// ================= VERIFY WEBHOOK ====================
+// ======================= VERIFY WEBHOOK =======================
 app.get("/webhook", (req, res) => {
-  if (
-    req.query["hub.mode"] === "subscribe" &&
-    req.query["hub.verify_token"] === VERIFY_TOKEN
-  ) {
-    return res.status(200).send(req.query["hub.challenge"]);
+  try {
+    if (
+      req.query["hub.mode"] === "subscribe" &&
+      req.query["hub.verify_token"] === VERIFY_TOKEN
+    ) {
+      return res.status(200).send(req.query["hub.challenge"]);
+    }
+    res.sendStatus(403);
+  } catch (e) {
+    console.error("Verify error", e);
+    res.sendStatus(200);
   }
-  res.sendStatus(403);
 });
 
-// ================= HANDLE WHATSAPP EVENTS ====================
+// ======================= WEBHOOK EVENTS =======================
 app.post("/webhook", async (req, res) => {
-  try {
-    for (const ent of req.body.entry || []) {
-      for (const ch of ent.changes || []) {
-        const val = ch.value || {};
-        const phoneNumberId = val.metadata?.phone_number_id;
+  (async () => {
+    try {
+      const entries = req.body.entry || [];
+      for (const ent of entries) {
+        for (const ch of ent.changes || []) {
+          const val = ch.value || {};
+          const phoneNumberId = val.metadata?.phone_number_id;
+          const callsArr = val.calls || [];
 
-        for (const call of val.calls || []) {
-          const callId = call.id;
-          const event = (call.event || "").toLowerCase();
+          for (const c of callsArr) {
+            const callId = c.id;
+            const event = (c.event || "").toLowerCase();
+            if (!callId) continue;
 
-          if (!callId) continue;
+            if (event === "connect") {
+              await handleOffer(callId, c.session?.sdp, phoneNumberId);
+            }
 
-          if (event === "connect") {
-            await handleOffer(callId, call.session.sdp, phoneNumberId);
-          }
+            if (event === "ice_candidate") {
+              await handleRemoteIce(callId, c.ice);
+            }
 
-          if (event === "ice_candidate") {
-            await handleRemoteIce(callId, call.ice);
-          }
-
-          if (["end", "terminate"].includes(event)) {
-            cleanup(callId);
+            if (["end", "terminate"].includes(event)) {
+              cleanup(callId);
+            }
           }
         }
       }
+    } catch (e) {
+      console.error("Webhook processing error:", e);
     }
+  })();
 
-    res.send("EVENT_RECEIVED");
-  } catch (e) {
-    console.error("Webhook error:", e);
-    res.sendStatus(500);
-  }
+  // 🔥 ALWAYS respond 200 — prevents WhatsApp retries
+  res.send("EVENT_RECEIVED");
 });
 
-// ================= HANDLE OFFER (FIXED) ====================
+// ======================= HANDLE OFFER =======================
 async function handleOffer(callId, offerSDP, phoneNumberId) {
-  console.log("📞 Incoming call:", callId);
+  try {
+    console.log("📞 Incoming call:", callId);
 
-  if (calls.has(callId)) cleanup(callId);
+    if (calls.has(callId)) cleanup(callId);
 
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-  });
+    // WebRTC
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
 
-  const audioSource = new nonstandard.RTCAudioSource();
-  const outTrack = audioSource.createTrack();
-  pc.addTrack(outTrack);
+    const audioSource = new nonstandard.RTCAudioSource();
+    const outTrack = audioSource.createTrack();
+    pc.addTrack(outTrack);
 
-  let sink = null;
-  let pcmQueue = [];
-
-  // FIXED: capture inbound audio correctly
-  pc.ontrack = (event) => {
-    console.log("🎧 Remote audio track received");
-    sink = new nonstandard.RTCAudioSink(event.track);
+    // Incoming audio from WhatsApp
+    const sink = new nonstandard.RTCAudioSink(outTrack);
+    let pcmQueue = [];
 
     sink.ondata = ({ samples }) => {
       pcmQueue.push(Buffer.from(Int16Array.from(samples).buffer));
     };
-  };
 
-  // ---- Process audio every 500ms ----
-  const processInterval = setInterval(async () => {
-    if (pcmQueue.length === 0) return;
+    // Process audio every 500ms
+    const processInterval = setInterval(async () => {
+      try {
+        if (pcmQueue.length === 0) return;
 
-    const pcm = Buffer.concat(pcmQueue);
-    pcmQueue = [];
+        const pcm = Buffer.concat(pcmQueue);
+        pcmQueue = [];
 
-    const raw = `in_${callId}.pcm`;
-    const wav = `in_${callId}.wav`;
-    fs.writeFileSync(raw, pcm);
+        const pcmFile = `in_${callId}.pcm`;
+        const wavFile = `in_${callId}.wav`;
 
-    try {
-      await execPromise(
-        `ffmpeg -y -f s16le -ar 48000 -ac 1 -i ${raw} ${wav}`
-      );
-    } catch (e) {
-      console.error("FFmpeg error:", e);
-      return;
-    }
+        fs.writeFileSync(pcmFile, pcm);
 
-    const transcript = await transcribe(wav);
-    if (!transcript?.trim()) return;
+        try {
+          await execPromise(
+            `ffmpeg -y -f s16le -ar 48000 -ac 1 -i ${pcmFile} ${wavFile}`
+          );
+        } catch (err) {
+          console.error("❌ FFmpeg error", err);
+          return;
+        }
 
-    console.log("🗣 User:", transcript);
+        const transcript = await transcribe(wavFile);
+        if (!transcript?.trim()) return;
 
-    const reply = await aiReply(transcript);
-    console.log("🤖 AI:", reply);
+        console.log("🗣 User:", transcript);
 
-    await streamTTS(reply, audioSource);
-  }, 500);
+        const reply = await aiReply(transcript);
+        console.log("🤖 AI:", reply);
 
-  // ICE
-  pc.onicecandidate = (e) => {
-    if (e.candidate) sendLocalIce(callId, phoneNumberId, e.candidate);
-  };
+        await streamTTS(reply, audioSource);
+      } catch (err) {
+        console.error("❌ Audio processing error:", err);
+      }
+    }, 500);
 
-  pc.onconnectionstatechange = () => {
-    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
-      cleanup(callId);
-    }
-  };
+    pc.onicecandidate = (e) => {
+      if (e.candidate)
+        sendLocalIce(callId, phoneNumberId, e.candidate).catch(console.error);
+    };
 
-  // ---- SDP handling ----
-  await pc.setRemoteDescription({ type: "offer", sdp: offerSDP });
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
+    pc.onconnectionstatechange = () => {
+      if (["failed", "closed", "disconnected"].includes(pc.connectionState))
+        cleanup(callId);
+    };
 
-  await new Promise((resolve) => {
+    await pc.setRemoteDescription({ type: "offer", sdp: offerSDP });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    await waitForICE(pc);
+
+    // ACCEPT CALL (Crash-proof)
+    await postCall(phoneNumberId, {
+      messaging_product: "whatsapp",
+      call_id: callId,
+      action: "pre_accept",
+      session: { sdp_type: "answer", sdp: pc.localDescription.sdp },
+    });
+
+    await postCall(phoneNumberId, {
+      messaging_product: "whatsapp",
+      call_id: callId,
+      action: "accept",
+      session: { sdp_type: "answer", sdp: pc.localDescription.sdp },
+    });
+
+    console.log("✅ Call accepted");
+
+    const silentInterval = startSilentAudio(audioSource);
+
+    calls.set(callId, {
+      pc,
+      sink,
+      audioSource,
+      processInterval,
+      silentInterval,
+    });
+  } catch (e) {
+    console.error("❌ handleOffer crash:", e);
+  }
+}
+
+// ======================= ICE WAIT =======================
+function waitForICE(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
     pc.onicegatheringstatechange = () => {
       if (pc.iceGatheringState === "complete") resolve();
     };
   });
-
-  // ---- send accept ----
-  await postCall(phoneNumberId, {
-    messaging_product: "whatsapp",
-    call_id: callId,
-    action: "pre_accept",
-    session: { sdp_type: "answer", sdp: pc.localDescription.sdp },
-  });
-
-  await postCall(phoneNumberId, {
-    messaging_product: "whatsapp",
-    call_id: callId,
-    action: "accept",
-    session: { sdp_type: "answer", sdp: pc.localDescription.sdp },
-  });
-
-  console.log("✅ Call accepted");
-
-  const silentInterval = startSilent(audioSource);
-
-  calls.set(callId, {
-    pc,
-    sink,
-    audioSource,
-    processInterval,
-    silentInterval,
-  });
 }
 
-// ================= STT ====================
+// ======================= TRANSCRIBE =======================
 async function transcribe(wavFile) {
-  const FormData = require("form-data");
-  const form = new FormData();
-  form.append("file", fs.createReadStream(wavFile));
-  form.append("model", "whisper-1");
+  try {
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("file", fs.createReadStream(wavFile));
+    form.append("model", "whisper-1");
 
-  const res = await axios.post(
-    "https://api.openai.com/v1/audio/transcriptions",
-    form,
-    {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
-    }
-  );
-
-  return res.data.text;
-}
-
-// ================= AI (Gemini / ChatGPT) ====================
-async function aiReply(text) {
-  if (AI_MODEL === "chatgpt") {
-    const res = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
+    const r = await safePOST(
+      "https://api.openai.com/v1/audio/transcriptions",
+      form,
       {
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: text }],
-      },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        ...form.getHeaders(),
+      }
     );
-    return res.data.choices[0].message.content;
+
+    return r?.data?.text || "";
+  } catch (e) {
+    console.error("❌ STT error:", e);
+    return "";
   }
-
-  // Gemini
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GOOGLE_API_KEY}`;
-  const payload = {
-    contents: [{ parts: [{ text: `Reply to: "${text}"` }] }],
-  };
-
-  const res = await axios.post(url, payload);
-  return (
-    res.data?.candidates?.[0]?.content?.[0]?.parts?.[0]?.text ||
-    "I cannot reply right now."
-  );
 }
 
-// ================= TTS STREAMER ====================
+// ======================= AI MODEL =======================
+async function aiReply(text) {
+  try {
+    if (AI_MODEL === "chatgpt") {
+      const r = await safePOST(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: text }],
+        },
+        { Authorization: `Bearer ${OPENAI_API_KEY}` }
+      );
+      return r?.data?.choices?.[0]?.message?.content || "I didn't understand.";
+    }
+
+    // Gemini
+    const r = await safePOST(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GOOGLE_API_KEY}`,
+      {
+        contents: [{ parts: [{ text: text }] }],
+      },
+      { "Content-Type": "application/json" }
+    );
+
+    return (
+      r?.data?.candidates?.[0]?.content?.[0]?.parts?.[0]?.text ||
+      "Sorry, I cannot reply."
+    );
+  } catch (e) {
+    console.error("❌ AI error:", e);
+    return "I had trouble replying.";
+  }
+}
+
+// ======================= TTS STREAM =======================
 async function streamTTS(text, audioSource) {
-  const res = await axios.post(
-    "https://api.openai.com/v1/audio/speech",
-    {
-      model: "gpt-4o-mini-tts",
-      voice: "alloy",
-      input: text,
-      format: "pcm16",
-    },
-    {
-      responseType: "arraybuffer",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+  try {
+    const r = await safePOST(
+      "https://api.openai.com/v1/audio/speech",
+      {
+        model: "gpt-4o-mini-tts",
+        voice: "alloy",
+        format: "pcm16",
+        input: text,
+      },
+      {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        responseType: "arraybuffer",
+      }
+    );
+
+    if (!r?.data) return;
+
+    const pcm = new Int16Array(r.data);
+    const FRAME = 960;
+
+    for (let i = 0; i < pcm.length; i += FRAME) {
+      let slice = pcm.subarray(i, i + FRAME);
+
+      if (slice.length < FRAME) {
+        const padded = new Int16Array(FRAME);
+        padded.set(slice);
+        slice = padded;
+      }
+
+      audioSource.onData({
+        samples: slice,
+        sampleRate: 48000,
+        bitsPerSample: 16,
+        channelCount: 1,
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
     }
-  );
-
-  const pcm = new Int16Array(res.data);
-  const FRAME = 960;
-
-  for (let i = 0; i < pcm.length; i += FRAME) {
-    let frame = pcm.subarray(i, i + FRAME);
-
-    if (frame.length < FRAME) {
-      const pad = new Int16Array(FRAME);
-      pad.set(frame);
-      frame = pad;
-    }
-
-    audioSource.onData({
-      samples: frame,
-      sampleRate: 48000,
-      bitsPerSample: 16,
-      channelCount: 1,
-    });
-
-    await sleep(20);
+  } catch (e) {
+    console.error("❌ TTS error:", e);
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ================= SILENT KEEPALIVE ====================
-function startSilent(source) {
+// ======================= SILENT KEEPALIVE =======================
+function startSilentAudio(source) {
   const silent = new Int16Array(960);
   return setInterval(() => {
-    source.onData({
-      samples: silent,
-      sampleRate: 48000,
-      bitsPerSample: 16,
-      channelCount: 1,
-    });
+    try {
+      source.onData({
+        samples: silent,
+        sampleRate: 48000,
+        bitsPerSample: 16,
+        channelCount: 1,
+      });
+    } catch (_) {}
   }, 20);
 }
 
-// ================= ICE ====================
+// ======================= ICE =======================
 async function handleRemoteIce(callId, ice) {
-  const c = calls.get(callId);
-  if (!c) return;
   try {
+    const c = calls.get(callId);
+    if (!c) return;
     await c.pc.addIceCandidate(ice);
   } catch (e) {
-    console.error("ICE error:", e);
+    console.error("❌ Remote ICE error:", e);
   }
 }
 
@@ -312,16 +363,16 @@ async function sendLocalIce(callId, phoneNumberId, cand) {
   });
 }
 
-// ================= POST CALL API ====================
+// ======================= POST CALL =======================
 async function postCall(phoneNumberId, body) {
-  return axios.post(
+  return safePOST(
     `${META_BASE_URL}/${META_API_VERSION}/${phoneNumberId}/calls`,
     body,
-    { headers: { Authorization: `Bearer ${META_ACCESS_TOKEN}` } }
+    { Authorization: `Bearer ${META_ACCESS_TOKEN}` }
   );
 }
 
-// ================= CLEANUP ====================
+// ======================= CLEANUP =======================
 function cleanup(callId) {
   const c = calls.get(callId);
   if (!c) return;
@@ -329,19 +380,19 @@ function cleanup(callId) {
   try {
     c.sink?.stop?.();
     c.pc?.close();
-    clearInterval(c.silentInterval);
     clearInterval(c.processInterval);
+    clearInterval(c.silentInterval);
   } catch (_) {}
 
   calls.delete(callId);
   console.log("🧹 Cleaned:", callId);
 }
 
-// ================= SERVER ====================
+// ======================= SERVER =======================
 app.get("/", (_, res) => res.send("WhatsApp AI Voice Server OK"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("🚀 Running on port", PORT));
+app.listen(PORT, () => console.log("🚀 Running on", PORT));
 
 
 
